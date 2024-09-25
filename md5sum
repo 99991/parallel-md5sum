@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+import re, os, sys, hashlib, threading, argparse
+from multiprocessing.pool import ThreadPool
+
+# Replace md5 with sha256 for sha256sum and so on
+METHOD = "md5"
+
+def main():
+    usage = f"{METHOD}sum [OPTION]... [FILE]..."
+
+    parser = argparse.ArgumentParser(description=f"Print or check {METHOD} ({hashlib.new(METHOD).digest_size * 8}-bit) checksums.", usage=usage)
+    parser.add_argument("-c", "--check", nargs="?", help=f"read {METHOD} sums from the FILEs and check them")
+    parser.add_argument("-m", "--method", "--mode", default=METHOD, help="hash algorithm to use", choices=hashlib.algorithms_available)
+
+    args, filenames = parser.parse_known_args()
+
+    name = sys.argv[0]
+
+    # Check checksums in provided file
+    if args.check:
+        check_checksums(args.method, args.check, name)
+        return
+
+    # If no filenames and no --check option, read from stdin
+    if not filenames:
+        h = hashlib.file_digest(sys.stdin.buffer, args.method)
+        print(f"{h.hexdigest()}  -")
+        return
+
+    def hash_file(filename):
+        if os.path.isdir(filename):
+            return "", f"{name}: {filename}: Is a directory"
+
+        try:
+            with open(filename, "rb") as f:
+                h = hashlib.file_digest(f, args.method)
+        except FileNotFoundError:
+            return "", f"{name}: {filename} No such file or directory"
+
+        return f"{h.hexdigest()}  {filename}", ""
+
+    # All remaining arguments are assumed to be files that should be hashed
+    with ThreadPool() as pool:
+        for stdout, stderr in pool.imap(hash_file, filenames):
+            if stderr:
+                print(stderr, file=sys.stderr)
+            if stdout:
+                print(stdout)
+
+class check_checksums:
+    def __init__(self, method, checksum_filename, name):
+        self.method = method
+        self.name = name
+        self.digest_size = hashlib.new(method).digest_size
+        self.lock = threading.Lock()
+
+        self.checksum_fails = 0
+        self.missing_files = 0
+        self.incorrect_lines = 0
+
+        with open(checksum_filename) as f:
+            lines = f.readlines()
+
+        with ThreadPool() as pool:
+            for stdout, stderr in pool.imap(self.check_checksum, lines):
+                if stderr:
+                    print(stderr, file=sys.stderr)
+                if stdout:
+                    print(stdout)
+
+        if self.incorrect_lines == 1:
+            print(f"{self.name}: WARNING: {self.incorrect_lines} line is improperly formatted", file=sys.stderr)
+        elif self.incorrect_lines > 1:
+            print(f"{self.name}: WARNING: {self.incorrect_lines} lines are improperly formatted", file=sys.stderr)
+
+        if self.missing_files == 1:
+            print(f"{self.name}: WARNING: {self.missing_files} listed file could not be read", file=sys.stderr)
+        elif self.missing_files > 0:
+            print(f"{self.name}: WARNING: {self.missing_files} listed files could not be read", file=sys.stderr)
+
+        if self.checksum_fails == 1:
+            print(f"{self.name}: WARNING: {self.checksum_fails} computed checksum did NOT match", file=sys.stderr)
+        elif self.checksum_fails > 0:
+            print(f"{self.name}: WARNING: {self.checksum_fails} computed checksums did NOT match", file=sys.stderr)
+
+    def check_checksum(self, line):
+        if line.startswith("#"):
+            return "", ""
+
+        checksum, filename = line.rstrip("\n").split(maxsplit=1)
+
+        # Check if line is properly formatted
+        if not re.match(f"^[a-fA-F0-9]{{{self.digest_size * 2}}}$", checksum):
+            with self.lock:
+                self.incorrect_lines += 1
+                return "", ""
+
+        # Discard leading "*" which indicate binary files
+        # TODO: Should handle binary and text files differently
+        if filename.startswith("*"):
+            filename = filename[1:]
+
+        try:
+            with open(filename, "rb") as f:
+                h = hashlib.file_digest(f, self.method)
+        except FileNotFoundError:
+            with self.lock:
+                self.missing_files += 1
+            return f"{filename}: FAILED open or read", f"{self.name}: {filename}: No such file or directory"
+
+        if h.hexdigest() == checksum:
+            return f"{filename}: OK", ""
+        else:
+            with self.lock:
+                self.checksum_fails += 1
+            return f"{filename}: FAILED", ""
+
+if __name__ == "__main__":
+    main()
